@@ -1,0 +1,99 @@
+# Publishes the web app to GitHub Pages as a static site.
+#
+# GitHub Pages cannot run the API or a database, so this job does the scheduler's work instead:
+# it refreshes the data, regenerates predictions, writes the API responses to JSON files and
+# builds the web app to read those files. It runs on every push and every six hours.
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/pyproject.toml
+
+      - name: Install backend
+        working-directory: backend
+        run: pip install -e .
+
+      # The SQLite database is carried from run to run so that genuine pre-match predictions are
+      # kept after kick-off. If the cache is ever lost the database is rebuilt from the providers.
+      - name: Restore database from the previous run
+        uses: actions/cache@v4
+        with:
+          path: backend/dev.db
+          key: football-db-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: football-db-
+
+      - name: Apply migrations
+        id: db
+        working-directory: backend
+        run: |
+          if [ -f dev.db ]; then echo "existing=true" >> "$GITHUB_OUTPUT"; fi
+          python -m alembic upgrade head
+
+      - name: Import history (first run only)
+        if: steps.db.outputs.existing != 'true'
+        working-directory: backend
+        run: |
+          python -m app.cli import --competition PL --seasons 2019 2020 2021 2022 2023 2024 2025 2026
+          python -m app.cli import --provider openfootball --competition PL --seasons 2026
+          python -m app.cli evaluate --competition PL
+
+      - name: Refresh current season and predictions
+        working-directory: backend
+        run: python -m app.cli refresh
+
+      - name: Export data for the static site
+        working-directory: backend
+        run: python -m app.cli export --competition PL --out ../frontend/public/data
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build web app
+        working-directory: frontend
+        env:
+          VITE_STATIC_DATA: "true"
+        run: |
+          npm ci
+          npm run build
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: frontend/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
