@@ -80,8 +80,10 @@ jobs:
         working-directory: frontend
         env:
           VITE_STATIC_DATA: "true"
+        # `npm install`, not `npm ci`: npm disagrees with itself about the optional WebAssembly
+        # packages in the lockfile (the @emnapi entries), and `npm ci` then refuses to install.
         run: |
-          npm ci
+          npm install --no-audit --no-fund
           npm run build
 
       - uses: actions/upload-pages-artifact@v3
